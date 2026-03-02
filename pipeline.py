@@ -28,17 +28,17 @@ API_URL = (
     "&timezone=Asia/Karachi"
 )
 
-DB_PATH = "weather_pipeline.db"
-WEATHER_TABLE = "lahore_weather"
-RUNS_TABLE = "pipeline_runs"
+DB_PATH = "weather_pipeline.db"                 # SQLite file written to the working directory
+WEATHER_TABLE = "lahore_weather"                # table that stores the transformed weather records
+RUNS_TABLE = "pipeline_runs"                    # audit table — one row per pipeline execution
 
-ROLLING_WINDOW = 7          # days for rolling statistics
-PRECIP_THRESHOLD = 0.0      # mm — above this value is classified as a rainy day
-ANOMALY_STD_FACTOR = 2.0    # standard deviations to flag a temperature anomaly
-TREND_DELTA_C = 0.5         # minimum mean difference (°C) to classify a trend
-REQUEST_TIMEOUT = 30        # seconds
-MAX_RETRIES = 3
-BACKOFF_FACTOR = 1          # seconds between retries (exponential)
+ROLLING_WINDOW = 7                              # number of days used for rolling mean / std / sum
+PRECIP_THRESHOLD = 0.0                          # mm; any value above this marks a day as rainy
+ANOMALY_STD_FACTOR = 2.0                        # temperature must exceed N×rolling_std to be flagged
+TREND_DELTA_C = 0.5                             # minimum °C shift between halves to label a trend
+REQUEST_TIMEOUT = 30                            # seconds before the HTTP request is aborted
+MAX_RETRIES = 3                                 # maximum retry attempts on transient API errors
+BACKOFF_FACTOR = 1                              # base seconds for exponential backoff between retries
 
 
 logging.basicConfig(
@@ -46,8 +46,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("pipeline.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),                              # print to console
+        logging.FileHandler("pipeline.log", mode="a", encoding="utf-8"),  # append to file
     ],
 )
 
@@ -57,15 +57,15 @@ logger = logging.getLogger("weather_etl")
 def _build_session() -> requests.Session:
     session = requests.Session()
     retry_policy = Retry(
-        total=MAX_RETRIES,
-        backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
+        total=MAX_RETRIES,                                  # total retry budget across all attempts
+        backoff_factor=BACKOFF_FACTOR,                      # wait = backoff_factor * 2^(attempt-1) seconds
+        status_forcelist=[429, 500, 502, 503, 504],         # HTTP codes that trigger a retry
+        allowed_methods=["GET"],                            # only retry safe, idempotent requests
+        raise_on_status=False,                              # let raise_for_status() handle HTTP errors
     )
     adapter = HTTPAdapter(max_retries=retry_policy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    session.mount("https://", adapter)                      # apply retry policy to all HTTPS calls
+    session.mount("http://", adapter)                       # apply retry policy to all HTTP calls
     return session
 
 
@@ -75,7 +75,7 @@ def extract(session: requests.Session) -> pd.DataFrame:
 
     try:
         response = session.get(API_URL, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
+        response.raise_for_status()                         # raise on 4xx / 5xx after retries exhausted
     except requests.exceptions.HTTPError as exc:
         logger.error("HTTP error from API: %s", exc)
         raise
@@ -89,7 +89,7 @@ def extract(session: requests.Session) -> pd.DataFrame:
     payload = response.json()
 
     required_fields = {"time", "temperature_2m_max", "temperature_2m_min", "precipitation_sum"}
-    daily_block = payload.get("daily", {})
+    daily_block = payload.get("daily", {})                  # the API nests all daily arrays under "daily"
     missing_fields = required_fields - set(daily_block.keys())
     if missing_fields:
         raise ValueError(f"API response missing expected fields: {sorted(missing_fields)}")
@@ -123,47 +123,50 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
       - pipeline_run_ts     : UTC timestamp of this pipeline execution
     """
     logger.info("TRANSFORM — processing %d raw records", len(df))
-    df = df.copy()
+    df = df.copy()                                          # avoid mutating the caller's DataFrame
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    df["date"] = pd.to_datetime(df["date"])                 # parse ISO strings to Timestamp objects
+    df = df.sort_values("date").reset_index(drop=True)      # ensure chronological order before rolling ops
 
     initial_count = len(df)
-    df = df.dropna(subset=["temp_max", "temp_min", "precipitation"])
+    df = df.dropna(subset=["temp_max", "temp_min", "precipitation"])  # rows missing core measurements are unusable
     dropped = initial_count - len(df)
     if dropped > 0:
         logger.warning("TRANSFORM — dropped %d rows with null values", dropped)
 
-    df["temp_avg"] = ((df["temp_max"] + df["temp_min"]) / 2).round(2)
-    df["temp_range"] = (df["temp_max"] - df["temp_min"]).round(2)
+    df["temp_avg"] = ((df["temp_max"] + df["temp_min"]) / 2).round(2)      # standard mean of daily high/low
+    df["temp_range"] = (df["temp_max"] - df["temp_min"]).round(2)           # diurnal range — indicator of dry vs humid days
 
     rolling_temp = df["temp_avg"].rolling(window=ROLLING_WINDOW, min_periods=ROLLING_WINDOW)
-    df["rolling_7d_avg_temp"] = rolling_temp.mean().round(2)
-    df["rolling_7d_std_temp"] = rolling_temp.std().round(3)
+    df["rolling_7d_avg_temp"] = rolling_temp.mean().round(2)                # smoothed temperature trend over the past week
+    df["rolling_7d_std_temp"] = rolling_temp.std().round(3)                 # variability — used as the baseline for anomaly detection
     df["rolling_7d_precip"] = (
-        df["precipitation"].rolling(window=ROLLING_WINDOW, min_periods=ROLLING_WINDOW).sum().round(2)
+        df["precipitation"]
+        .rolling(window=ROLLING_WINDOW, min_periods=ROLLING_WINDOW)
+        .sum()
+        .round(2)                                                            # total rainfall in the trailing 7-day window
     )
 
-    df["is_rainy"] = df["precipitation"] > PRECIP_THRESHOLD
+    df["is_rainy"] = df["precipitation"] > PRECIP_THRESHOLD                 # True when any measurable rain was recorded
 
-    deviation = (df["temp_avg"] - df["rolling_7d_avg_temp"]).abs()
-    df["temp_anomaly"] = (deviation > ANOMALY_STD_FACTOR * df["rolling_7d_std_temp"]).fillna(False)
+    deviation = (df["temp_avg"] - df["rolling_7d_avg_temp"]).abs()          # absolute departure from the rolling baseline
+    df["temp_anomaly"] = (deviation > ANOMALY_STD_FACTOR * df["rolling_7d_std_temp"]).fillna(False)  # True when deviation exceeds 2 std
 
-    midpoint = len(df) // 2
+    midpoint = len(df) // 2                                 # split the dataset into two equal halves
     first_half_mean = df["temp_avg"].iloc[:midpoint].mean()
     second_half_mean = df["temp_avg"].iloc[midpoint:].mean()
-    delta = second_half_mean - first_half_mean
+    delta = second_half_mean - first_half_mean              # positive = temperature rose over the period
     if delta > TREND_DELTA_C:
         trend_label = "warming"
     elif delta < -TREND_DELTA_C:
         trend_label = "cooling"
     else:
         trend_label = "stable"
-    df["period_trend"] = trend_label
+    df["period_trend"] = trend_label                        # same label applied to every row for easy querying
 
-    df["pipeline_run_ts"] = datetime.utcnow().isoformat(timespec="seconds")
+    df["pipeline_run_ts"] = datetime.utcnow().isoformat(timespec="seconds")  # UTC timestamp for lineage tracking
 
-    df = df.dropna(subset=["rolling_7d_avg_temp"]).reset_index(drop=True)
+    df = df.dropna(subset=["rolling_7d_avg_temp"]).reset_index(drop=True)   # drop the first 6 rows where the rolling window is incomplete
 
     logger.info("TRANSFORM — %d records after enrichment (window warm-up removed)", len(df))
     return df
@@ -174,18 +177,17 @@ def load(df: pd.DataFrame) -> int:
     logger.info("LOAD — writing %d records to '%s'", len(df), DB_PATH)
 
     run_record = {
-        "run_ts": datetime.utcnow().isoformat(timespec="seconds"),
-        "records_loaded": len(df),
+        "run_ts": datetime.utcnow().isoformat(timespec="seconds"),  # when this load started
+        "records_loaded": len(df),                                  # row count for auditing
         "status": "success",
         "error_message": None,
     }
 
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            df.to_sql(WEATHER_TABLE, conn, if_exists="replace", index=False)
-
+        with sqlite3.connect(DB_PATH) as conn:                      # context manager commits or rolls back automatically
+            df.to_sql(WEATHER_TABLE, conn, if_exists="replace", index=False)  # full refresh on every run
             pd.DataFrame([run_record]).to_sql(
-                RUNS_TABLE, conn, if_exists="append", index=False
+                RUNS_TABLE, conn, if_exists="append", index=False   # append — preserves full run history
             )
     except sqlite3.Error as exc:
         logger.error("LOAD — database error: %s", exc)
@@ -201,11 +203,11 @@ def analyze(df: pd.DataFrame) -> dict:
 
     Returns a dict of key metrics suitable for downstream use (dashboards, alerts).
     """
-    hottest_row = df.loc[df["temp_max"].idxmax()]
-    coldest_row = df.loc[df["temp_min"].idxmin()]
-    rainy_days = int(df["is_rainy"].sum())
-    anomaly_days = int(df["temp_anomaly"].sum())
-    trend = str(df["period_trend"].iloc[-1])
+    hottest_row = df.loc[df["temp_max"].idxmax()]           # row with the highest recorded temperature
+    coldest_row = df.loc[df["temp_min"].idxmin()]           # row with the lowest recorded temperature
+    rainy_days = int(df["is_rainy"].sum())                  # count of days with measurable precipitation
+    anomaly_days = int(df["temp_anomaly"].sum())            # count of statistically unusual temperature days
+    trend = str(df["period_trend"].iloc[-1])                # read from any row — value is uniform across the dataset
 
     metrics = {
         "period_start": df["date"].min().date().isoformat(),
@@ -271,7 +273,7 @@ def run_pipeline() -> Optional[dict]:
         elapsed = (datetime.utcnow() - start_ts).total_seconds()
         logger.exception("Pipeline failed after %.2fs", elapsed)
 
-        try:
+        try:                                                # best-effort: record the failure; do not swallow original error
             with sqlite3.connect(DB_PATH) as conn:
                 pd.DataFrame([{
                     "run_ts": datetime.utcnow().isoformat(timespec="seconds"),
@@ -285,7 +287,7 @@ def run_pipeline() -> Optional[dict]:
         sys.exit(1)
 
     finally:
-        session.close()
+        session.close()                                     # always release the connection pool
 
 
 if __name__ == "__main__":
