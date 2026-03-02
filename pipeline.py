@@ -20,10 +20,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 API_URL = (
     "https://api.open-meteo.com/v1/forecast"
     "?latitude=31.5&longitude=74.3"
@@ -45,10 +41,6 @@ MAX_RETRIES = 3
 BACKOFF_FACTOR = 1          # seconds between retries (exponential)
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
@@ -61,10 +53,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("weather_etl")
 
-
-# ---------------------------------------------------------------------------
-# HTTP session with retry + backoff
-# ---------------------------------------------------------------------------
 
 def _build_session() -> requests.Session:
     session = requests.Session()
@@ -80,10 +68,6 @@ def _build_session() -> requests.Session:
     session.mount("http://", adapter)
     return session
 
-
-# ---------------------------------------------------------------------------
-# Stage 1: Extract
-# ---------------------------------------------------------------------------
 
 def extract(session: requests.Session) -> pd.DataFrame:
     """Fetch raw daily weather data from the Open-Meteo API."""
@@ -104,7 +88,6 @@ def extract(session: requests.Session) -> pd.DataFrame:
 
     payload = response.json()
 
-    # --- Schema validation ---
     required_fields = {"time", "temperature_2m_max", "temperature_2m_min", "precipitation_sum"}
     daily_block = payload.get("daily", {})
     missing_fields = required_fields - set(daily_block.keys())
@@ -125,10 +108,6 @@ def extract(session: requests.Session) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: Transform
-# ---------------------------------------------------------------------------
-
 def transform(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean and enrich the raw weather DataFrame.
@@ -146,22 +125,18 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("TRANSFORM — processing %d raw records", len(df))
     df = df.copy()
 
-    # Type coercion
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Drop rows missing critical measurements
     initial_count = len(df)
     df = df.dropna(subset=["temp_max", "temp_min", "precipitation"])
     dropped = initial_count - len(df)
     if dropped > 0:
         logger.warning("TRANSFORM — dropped %d rows with null values", dropped)
 
-    # Core features
     df["temp_avg"] = ((df["temp_max"] + df["temp_min"]) / 2).round(2)
     df["temp_range"] = (df["temp_max"] - df["temp_min"]).round(2)
 
-    # Rolling statistics
     rolling_temp = df["temp_avg"].rolling(window=ROLLING_WINDOW, min_periods=ROLLING_WINDOW)
     df["rolling_7d_avg_temp"] = rolling_temp.mean().round(2)
     df["rolling_7d_std_temp"] = rolling_temp.std().round(3)
@@ -169,14 +144,11 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
         df["precipitation"].rolling(window=ROLLING_WINDOW, min_periods=ROLLING_WINDOW).sum().round(2)
     )
 
-    # Classification flags
     df["is_rainy"] = df["precipitation"] > PRECIP_THRESHOLD
 
-    # Anomaly detection: temperature deviates more than N std from rolling mean
     deviation = (df["temp_avg"] - df["rolling_7d_avg_temp"]).abs()
     df["temp_anomaly"] = (deviation > ANOMALY_STD_FACTOR * df["rolling_7d_std_temp"]).fillna(False)
 
-    # Period-level trend (compare first vs second half mean temperature)
     midpoint = len(df) // 2
     first_half_mean = df["temp_avg"].iloc[:midpoint].mean()
     second_half_mean = df["temp_avg"].iloc[midpoint:].mean()
@@ -189,19 +161,13 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
         trend_label = "stable"
     df["period_trend"] = trend_label
 
-    # Pipeline metadata
     df["pipeline_run_ts"] = datetime.utcnow().isoformat(timespec="seconds")
 
-    # Drop rows where rolling stats could not be computed (first ROLLING_WINDOW - 1 rows)
     df = df.dropna(subset=["rolling_7d_avg_temp"]).reset_index(drop=True)
 
     logger.info("TRANSFORM — %d records after enrichment (window warm-up removed)", len(df))
     return df
 
-
-# ---------------------------------------------------------------------------
-# Stage 3: Load
-# ---------------------------------------------------------------------------
 
 def load(df: pd.DataFrame) -> int:
     """Persist transformed data to SQLite and record the pipeline run metadata."""
@@ -228,10 +194,6 @@ def load(df: pd.DataFrame) -> int:
     logger.info("LOAD — complete")
     return len(df)
 
-
-# ---------------------------------------------------------------------------
-# Stage 4: Analyze
-# ---------------------------------------------------------------------------
 
 def analyze(df: pd.DataFrame) -> dict:
     """
@@ -284,10 +246,6 @@ def analyze(df: pd.DataFrame) -> dict:
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
-
 def run_pipeline() -> Optional[dict]:
     """
     Execute the full ETL pipeline.
@@ -313,7 +271,6 @@ def run_pipeline() -> Optional[dict]:
         elapsed = (datetime.utcnow() - start_ts).total_seconds()
         logger.exception("Pipeline failed after %.2fs", elapsed)
 
-        # Record failed run
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 pd.DataFrame([{
@@ -323,7 +280,7 @@ def run_pipeline() -> Optional[dict]:
                     "error_message": "See pipeline.log for details",
                 }]).to_sql(RUNS_TABLE, conn, if_exists="append", index=False)
         except Exception:  # noqa: BLE001
-            pass  # do not mask the original error
+            pass
 
         sys.exit(1)
 
