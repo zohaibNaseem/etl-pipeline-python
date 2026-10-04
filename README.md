@@ -30,8 +30,8 @@ flowchart LR
 ## Setup
 
 ```bash
-git clone https://github.com/zohaibNaseem/etl-pipeline-python.git
-cd etl-pipeline-python
+git clone https://github.com/zohaibNaseem/weather-etl-pipeline.git
+cd weather-etl-pipeline
 
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
